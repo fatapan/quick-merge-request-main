@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile:*)",
+      "Bash(python:*)",
+      "Read(//e/**)",
+      "Bash(pip --version)",
+      "Bash(\"E:/py_envs/quick-mr-env/Scripts/pip.exe\" install -r \"e:/ChromeDownload/quick-merge-request-main/requirements.txt\")",
+      "Bash(\"E:/py_envs/quick-mr-env/Scripts/python.exe\" -c \"from PyQt5.QtWidgets import QApplication; print\\(''PyQt5 imported successfully''\\)\")",
+      "Bash(\"E:/py_envs/quick-mr-env/Scripts/python.exe\" \"e:/ChromeDownload/quick-merge-request-main/main.py\" --version)",
+      "Bash(echo \"Exit code: $?\")",
+      "Bash(\"E:/py_envs/quick-mr-env/Scripts/python.exe\" -c \"import sys; print\\(''Python works''\\); from PyQt5.QtWidgets import QApplication; print\\(''PyQt5 works''\\)\")",
+      "Bash(dir \"E:\\\\py_envs\\\\quick-mr-env\\\\Scripts\\\\python.exe\")",
+      "Bash(\"E:/py_envs/quick-mr-env/Scripts/python.exe\" -c \"import quick_create_branch; import quick_generate_mr_form; print\\(''语法检查通过''\\)\")",
+      "Bash(\"E:/py_envs/quick-mr-env/Scripts/python.exe\" -c \"from app.ui.workspace_tab import WorkspaceTab; print\\(''语法检查通过''\\)\")",
+      "Bash(\"E:/py_envs/quick-mr-env/Scripts/python.exe\" -c \"from app.ui.merge_conflict_dialog import MergeConflictDialog; print\\(''语法检查通过''\\)\")"
+    ]
+  }
+}

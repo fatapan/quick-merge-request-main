@@ -1,0 +1,387 @@
+import os
+import xml.etree.ElementTree as ET
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QPushButton, QFileDialog,
+    QLabel, QInputDialog, QMessageBox, QMenu
+)
+from PyQt5.QtGui import QIcon, QPainter, QColor
+from PyQt5.QtWidgets import QSystemTrayIcon
+from app.styles import apply_global_styles
+from app.ui.workspace_tab import WorkspaceTab
+from app.ui.commit_notification_dialog import CommitNotificationDialog
+from app.git_watcher import get_global_watcher
+
+class App(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.title = 'GitLab 快捷工具'
+        self.left = 100
+        self.top = 100
+        self.width = 800
+        self.height = 700
+        self.config = self.load_config()
+        self.git_watcher = get_global_watcher()
+        # 设置主窗口引用，用于通知按钮点击时打开对话框
+        self.git_watcher.set_main_window(self)
+        self.tray_icon = None
+        self.initUI()
+        self.init_system_tray()
+        # 启动定时器检查待处理的创建 MR 请求
+        self._start_pending_mr_checker()
+
+    def load_config(self):
+        try:
+            tree = ET.parse('config.xml')
+            root = tree.getroot()
+            return root
+        except (FileNotFoundError, ET.ParseError):
+            root = ET.Element('config')
+            ET.SubElement(root, 'gitlab')
+            ET.SubElement(root, 'workspaces')
+            tree = ET.ElementTree(root)
+            tree.write('config.xml', encoding='UTF-8', xml_declaration=True)
+            return root
+
+    def save_config(self):
+        if self.config is not None:
+            workspaces_node = self.config.find('workspaces')
+            if workspaces_node is None:
+                workspaces_node = ET.SubElement(self.config, 'workspaces')
+            for ws in workspaces_node.findall('workspace'):
+                workspaces_node.remove(ws)
+            for i in range(self.workspace_tabs.count()):
+                tab_widget = self.workspace_tabs.widget(i)
+                if isinstance(tab_widget, WorkspaceTab):
+                    ws_node = ET.SubElement(workspaces_node, 'workspace', {
+                        'name': self.workspace_tabs.tabText(i),
+                        'path': tab_widget.path
+                    })
+                    for j in range(tab_widget.target_branch_list.count()):
+                        branch_name = tab_widget.target_branch_list.item(j).text()
+                        ET.SubElement(ws_node, 'target_branch').text = branch_name
+            tree = ET.ElementTree(self.config)
+            tree.write('config.xml', encoding='UTF-8', xml_declaration=True)
+
+    def initUI(self):
+        self.setWindowTitle(self.title)
+        self.setGeometry(self.left, self.top, self.width, self.height)
+
+        main_layout = QVBoxLayout()
+
+        workspace_buttons_layout = QHBoxLayout()
+        self.add_workspace_button = QPushButton('添加工作目录')
+        self.notification_button = QPushButton('新提交通知')
+        workspace_buttons_layout.addWidget(self.add_workspace_button)
+        workspace_buttons_layout.addWidget(self.notification_button)
+        main_layout.addLayout(workspace_buttons_layout)
+
+        self.workspace_tabs = QTabWidget()
+        self.workspace_tabs.setTabsClosable(True)
+        self.workspace_tabs.tabCloseRequested.connect(self.remove_workspace_tab)
+        self.workspace_tabs.currentChanged.connect(self.on_workspace_tab_changed)
+        self.welcome_tab = QWidget()
+        welcome_layout = QVBoxLayout()
+        welcome_label = QLabel('请选择一个工作区标签页以开始')
+        welcome_label.setAlignment(Qt.AlignCenter)
+        welcome_label.setObjectName('welcomeLabel')  # 设置对象名称
+        welcome_layout.addWidget(welcome_label)
+        self.welcome_tab.setLayout(welcome_layout)
+        self.workspace_tabs.addTab(self.welcome_tab, '')
+        welcome_index = self.workspace_tabs.indexOf(self.welcome_tab)
+        if welcome_index != -1:
+            self.workspace_tabs.tabBar().setTabVisible(welcome_index, False)
+        self.workspace_tabs.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.workspace_tabs.customContextMenuRequested.connect(self.show_workspace_context_menu)
+        main_layout.addWidget(self.workspace_tabs)
+
+        self.setLayout(main_layout)
+
+        self.add_workspace_button.clicked.connect(self.add_workspace)
+        self.notification_button.clicked.connect(self.show_commit_notifications)
+
+        self.load_workspaces()
+        self.apply_styles()
+
+    def load_workspaces(self):
+        if self.config is not None:
+            workspaces_node = self.config.find('workspaces')
+            if workspaces_node is not None:
+                removed_workspaces = []
+                for ws in list(workspaces_node.findall('workspace')):
+                    name = ws.get('name')
+                    path = ws.get('path')
+                    if name and path and os.path.isdir(path):
+                        self.add_workspace_tab(name, path, ws, make_current=False)
+                    else:
+                        removed_workspaces.append(name or path or '未命名工作区')
+                        workspaces_node.remove(ws)
+                if removed_workspaces:
+                    self.save_config()
+                    QMessageBox.warning(self, '移除无效的工作区',
+                                        '以下工作区的路径无效，已被自动移除：\n\n' + '\n'.join(removed_workspaces))
+
+    def add_workspace(self):
+        path = QFileDialog.getExistingDirectory(self, "选择工作区目录")
+        if path:
+            name, ok = QInputDialog.getText(self, '工作区名称', '为这个工作区输入一个名称:', text=path.split('/')[-1])
+            if ok and name:
+                self.add_workspace_tab(name, path, None)
+                self.save_config()
+
+    def add_workspace_tab(self, name, path, workspace_config, make_current=True):
+        # 标准化路径为绝对路径
+        path = os.path.abspath(path)
+        tab = WorkspaceTab(path, self.config, workspace_config, name)
+        self.workspace_tabs.addTab(tab, name)
+        if make_current:
+            self.workspace_tabs.setCurrentWidget(tab)
+
+        # 启动 Git 监听，传递 workspace name
+        self.git_watcher.add_repository(path, name)
+
+    def remove_workspace_tab(self, index):
+        if index < 0:
+            return
+        tab_name = self.workspace_tabs.tabText(index)
+        reply = QMessageBox.question(self, '确认移除',
+                                     f"您确定要移除工作区 '{tab_name}'吗？",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            tab_widget = self.workspace_tabs.widget(index)
+            if isinstance(tab_widget, WorkspaceTab):
+                # 停止 Git 监听
+                self.git_watcher.remove_repository(tab_widget.path)
+
+            self.workspace_tabs.removeTab(index)
+            self.save_config()
+
+    def closeEvent(self, event):
+        """关闭窗口事件 - 显示选择对话框"""
+        if self.tray_icon and self.tray_icon.isVisible():
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle('关闭窗口')
+            msg_box.setText('您希望如何操作？')
+
+            minimize_btn = msg_box.addButton("最小化到托盘", QMessageBox.YesRole)
+            quit_btn = msg_box.addButton("退出程序", QMessageBox.NoRole)
+            cancel_btn = msg_box.addButton("取消", QMessageBox.RejectRole)
+
+            msg_box.setDefaultButton(minimize_btn)
+            msg_box.exec_()
+
+            if msg_box.clickedButton() == minimize_btn:
+                # 最小化到托盘
+                event.ignore()
+                self.hide()
+                self.tray_icon.showMessage(
+                    self.title,
+                    "程序已最小化到系统托盘",
+                    QSystemTrayIcon.Information,
+                    2000
+                )
+            elif msg_box.clickedButton() == quit_btn:
+                # 退出程序
+                self.quit_app()
+                event.accept()
+            else:
+                # 取消
+                event.ignore()
+        else:
+            # 没有托盘支持，直接退出
+            self.quit_app()
+            event.accept()
+
+    def on_workspace_tab_changed(self, index):
+        w = self.workspace_tabs.widget(index)
+        if isinstance(w, WorkspaceTab):
+            w.reload_new_branch_history()
+            w.ensure_initialized()
+            for i in range(self.workspace_tabs.count()):
+                if self.workspace_tabs.widget(i) is self.welcome_tab:
+                    self.workspace_tabs.removeTab(i)
+                    break
+
+    def show_workspace_context_menu(self, position):
+        tab_index = self.workspace_tabs.tabBar().tabAt(position)
+        if tab_index != -1:
+            context_menu = QMenu(self)
+            rename_action = context_menu.addAction('重命名')
+            rename_action.triggered.connect(lambda: self.rename_workspace_tab(tab_index))
+            context_menu.exec_(self.workspace_tabs.mapToGlobal(position))
+
+    def rename_workspace_tab(self, index):
+        current_name = self.workspace_tabs.tabText(index)
+        tab_widget = self.workspace_tabs.widget(index)
+        if isinstance(tab_widget, WorkspaceTab):
+            tab_path = tab_widget.path
+        else:
+            tab_path = "Unknown Path"
+        new_name, ok = QInputDialog.getText(self, '重命名工作区',
+                                            '输入新的工作区名称:',
+                                            text=current_name)
+        if ok and new_name:
+            self.workspace_tabs.setTabText(index, new_name)
+            if self.config is not None:
+                workspaces_node = self.config.find('workspaces')
+                if workspaces_node is not None:
+                    for ws in workspaces_node.findall('workspace'):
+                        if ws.get('path') == tab_path:
+                            ws.set('name', new_name)
+                            break
+            self.save_config()
+
+    def apply_styles(self):
+        apply_global_styles()
+
+    def create_tray_icon(self):
+        """创建托盘图标"""
+        pixmap = QIcon()
+        # 创建一个简单的图标
+        from PyQt5.QtGui import QPixmap
+        from PyQt5.QtCore import QSize
+        size = 32
+        px = QPixmap(size, size)
+        px.fill(Qt.transparent)
+        painter = QPainter(px)
+        painter.setRenderHint(QPainter.Antialiasing)
+        # 绘制圆形背景
+        painter.setBrush(QColor("#FC6D26"))  # GitLab 橙色
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(0, 0, size, size)
+        # 绘制 "G" 字
+        painter.setPen(QColor("#FFFFFF"))
+        font = painter.font()
+        font.setPixelSize(20)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(px.rect(), Qt.AlignCenter, "G")
+        painter.end()
+        return QIcon(px)
+
+    def init_system_tray(self):
+        """初始化系统托盘"""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+
+        self.tray_icon = QSystemTrayIcon(self.create_tray_icon(), self)
+        self.tray_icon.setToolTip(self.title)
+
+        # 创建托盘菜单
+        tray_menu = QMenu()
+        show_action = tray_menu.addAction("显示窗口")
+        show_action.triggered.connect(self.show_window)
+        quit_action = tray_menu.addAction("退出程序")
+        quit_action.triggered.connect(self.quit_app)
+
+        self.tray_icon.setContextMenu(tray_menu)
+
+        # 左键点击恢复窗口
+        self.tray_icon.activated.connect(self.on_tray_icon_activated)
+
+        self.tray_icon.show()
+
+    def on_tray_icon_activated(self, reason):
+        """托盘图标被点击时的处理"""
+        if reason == QSystemTrayIcon.Trigger:  # 左键点击
+            self.show_window()
+
+    def show_window(self):
+        """显示主窗口"""
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
+
+    def quit_app(self):
+        """完全退出程序"""
+        self.save_config()
+        if hasattr(self, '_pending_mr_timer'):
+            self._pending_mr_timer.stop()
+        self.git_watcher.stop_all()
+        QApplication.instance().quit()
+
+    def _start_pending_mr_checker(self):
+        """启动定时器检查待处理的创建 MR 请求"""
+        self._pending_mr_timer = QTimer(self)
+        self._pending_mr_timer.timeout.connect(self._check_pending_mr_requests)
+        self._pending_mr_timer.start(500)  # 每 500ms 检查一次
+
+    def _check_pending_mr_requests(self):
+        """检查并处理待处理的创建 MR 请求"""
+        if not self.git_watcher.pending_create_mr_requests:
+            return
+
+        # 取出所有待处理的请求
+        requests = self.git_watcher.pending_create_mr_requests[:]
+        self.git_watcher.pending_create_mr_requests.clear()
+
+        for request in requests:
+            try:
+                from app.ui.create_mr_dialog import CreateMRDialog
+                from PyQt5.QtCore import Qt
+                # 如果主窗口隐藏，先显示主窗口以避免对话框关闭时程序退出
+                was_hidden = self.isHidden()
+                if was_hidden:
+                    self.show()
+
+                dialog = CreateMRDialog(
+                    repo_path=request.repo_path,
+                    workspace_name=request.workspace_name,
+                    config=self.config,
+                    source_branch=request.branch,
+                    parent=self
+                )
+                # 设置为工具窗口，打开时置顶
+                dialog.setWindowFlags(dialog.windowFlags() | Qt.Tool)
+                dialog.show()
+                dialog.raise_()
+                dialog.activateWindow()
+                dialog.exec_()
+
+                # 如果之前是隐藏的，再次隐藏
+                if was_hidden:
+                    self.hide()
+            except Exception as e:
+                QMessageBox.warning(self, '错误', f'打开创建 MR 对话框失败: {e}')
+
+    def show_commit_notifications(self):
+        """显示提交通知对话框"""
+        # 如果主窗口隐藏，先显示主窗口以避免对话框关闭时程序退出
+        was_hidden = self.isHidden()
+        if was_hidden:
+            self.show()
+
+        # 直接传递 watcher 的 commits 列表的引用，而不是副本
+        dialog = CommitNotificationDialog(self.git_watcher.commits, self)
+        # 设置为工具窗口，打开时置顶
+        dialog.setWindowFlags(dialog.windowFlags() | Qt.Tool)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        result = dialog.exec_()
+
+        # 如果之前是隐藏的，再次隐藏
+        if was_hidden:
+            self.hide()
+
+        # 如果用户在对话框中清空了记录，需要更新 watcher
+        if not self.git_watcher.commits:
+            self.git_watcher.clear_commits()
+
+    def show_notification_from_watcher(self):
+        """从 GitWatcher 调用的方法，用于在主线程中显示系统通知"""
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{timestamp}] [MainWindow] show_notification_from_watcher 被调用")
+
+        # 从 watcher 中获取待显示的 commit
+        commit = getattr(self.git_watcher, '_pending_notification_commit', None)
+        if commit:
+            # 调用 watcher 的通知方法，现在在主线程中执行
+            self.git_watcher._show_system_notification(commit)
+            # 清除临时保存的 commit
+            self.git_watcher._pending_notification_commit = None
+        else:
+            print(f"[{timestamp}] [MainWindow] 警告: _pending_notification_commit 为 None")
+

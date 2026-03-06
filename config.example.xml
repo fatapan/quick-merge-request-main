@@ -1,0 +1,30 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<config>
+    <new_branch_prefix>xxx/{tab_name}_</new_branch_prefix>
+    <gitlab>
+        <gitlab_url>https://kaizen-gitlab.internal.toppanecquaria.com/</gitlab_url>
+        <private_token>kaizen-int-b_nHSh4q7SfUeulGMTaJ6W86MQp1OjFjCA.01.0y1imxk93</private_token>
+        <assignee>yichun@ecquaria.com</assignee>
+        <reviewer>liumeng@ecquaria.com</reviewer>
+        <title_template>{commit_message}</title_template>
+        <description_template>## Description of Changes
+
+{commit_message}
+
+## Type of Change
+(Please tick one)
+- [x] Bug Fix
+- [ ] Feature
+- [ ] Refactoring
+- [ ] Documentation
+- [ ] Tests
+
+## Taiga Number and link
+[TG-{tg_number_from_title}](https://taiga.ecquaria.org/project/tecq-agp/search?text={tg_number_from_title})
+
+## Checklist before review
+- [x] I have performed a self-review of the code
+- [x] No conflict with target branch</description_template>
+    </gitlab>
+
+</config>

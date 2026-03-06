@@ -1,0 +1,36 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.env
+.venv
+venv/
+
+# ===== IDE =====
+.idea/
+.vscode/
+*.iml
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+
+# ===== Project local files =====
+# cache database
+cache.db
+cache.db.*
+*.db
+*.sqlite
+*.sqlite3
+
+# local config (do not commit)
+config.xml
+
+# ===== Logs =====
+*.log
+
+# ===== Build / dist =====
+build/
+dist/
+*.egg-info/

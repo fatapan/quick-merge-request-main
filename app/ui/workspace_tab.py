@@ -1,0 +1,1123 @@
+import shelve
+import xml.etree.ElementTree as ET
+from PyQt5.QtWidgets import (
+    QCheckBox,
+    QWidget, QTabWidget, QFormLayout, QLineEdit, QHBoxLayout, QPushButton,
+    QVBoxLayout, QListWidget, QAbstractItemView, QTextEdit, QComboBox, QMessageBox, QDialog
+)
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtWidgets import QApplication
+
+from app.async_utils import run_blocking
+from quick_create_branch import create_branch as create_branch_func, get_remote_branches
+from quick_generate_mr_form import (
+    get_local_branches, get_all_local_branches, generate_mr, get_mr_defaults,
+    parse_target_branch_from_source, get_gitlab_usernames, get_branch_diff,
+    get_commits_between_branches
+)
+from app.widgets import NoWheelComboBox, enable_combo_search as util_enable_combo_search
+from PyQt5.QtWidgets import QScrollArea, QLabel
+from app.ui.commit_diff_dialog import CommitDiffDialog
+
+class WorkspaceTab(QWidget):
+    def __init__(self, path, config, workspace_config, workspace_name=None):
+        super().__init__()
+        self.path = path
+        self.config = config
+        self.workspace_config = workspace_config
+        self.workspace_name = workspace_name or ''
+        self.initialized = False
+        self.initUI()
+
+    def initUI(self):
+        self.tools_tabs = QTabWidget()
+        self.create_branch_tab = QWidget()
+        self.create_mr_tab = QWidget()
+        self.cherry_pick_tab = QWidget()
+
+        self.tools_tabs.addTab(self.create_branch_tab, '创建分支')
+        self.tools_tabs.addTab(self.cherry_pick_tab, '快速Cherry-pick')
+        self.tools_tabs.addTab(self.create_mr_tab, '创建合并请求')
+
+        self.init_create_branch_tab()
+        self.init_create_mr_tab()
+        self.init_cherry_pick_tab()
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.tools_tabs)
+        self.setLayout(layout)
+
+    def init_create_branch_tab(self):
+        layout = QFormLayout()
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+        new_branch_prefix = self.get_default_new_branch_prefix()
+        self.new_branch_combo = QComboBox()
+        self.new_branch_combo.setEditable(True)
+        self.new_branch_combo.setEditText(new_branch_prefix)
+        self.clear_new_branch_history_button = QPushButton('清空历史')
+        new_branch_row = QHBoxLayout()
+        new_branch_row.addWidget(self.new_branch_combo)
+        new_branch_row.addWidget(self.clear_new_branch_history_button)
+        layout.addRow('新分支名:', new_branch_row)
+        self.load_new_branch_history()
+
+        self.branch_search_input = QLineEdit()
+        self.branch_search_input.setPlaceholderText('搜索分支...')
+        self.branch_search_input.textChanged.connect(self.filter_available_branches)
+
+        shuttle_layout = QHBoxLayout()
+
+        available_layout = QVBoxLayout()
+        available_layout.addWidget(self.branch_search_input)
+        self.available_branches_list = QListWidget()
+        self.available_branches_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        available_layout.addWidget(self.available_branches_list)
+
+        move_buttons_layout = QVBoxLayout()
+        self.add_to_target_button = QPushButton('>>')
+        self.remove_from_target_button = QPushButton('<<')
+        move_buttons_layout.addStretch()
+        move_buttons_layout.addWidget(self.add_to_target_button)
+        move_buttons_layout.addWidget(self.remove_from_target_button)
+        move_buttons_layout.addStretch()
+
+        self.target_branch_list = QListWidget()
+        self.target_branch_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        if self.workspace_config is not None:
+            for branch_node in self.workspace_config.findall('target_branch'):
+                self.target_branch_list.addItem(branch_node.text)
+
+        shuttle_layout.addLayout(available_layout)
+        shuttle_layout.addLayout(move_buttons_layout)
+        shuttle_layout.addWidget(self.target_branch_list)
+
+        branch_buttons_layout = QHBoxLayout()
+        self.refresh_remote_branches_button = QPushButton('刷新远程分支')
+        branch_buttons_layout.addWidget(self.refresh_remote_branches_button)
+        branch_buttons_layout.addStretch()
+
+        layout.addRow('可选远程分支', branch_buttons_layout)
+        layout.addRow(shuttle_layout)
+
+        self.create_branch_button = QPushButton('创建分支')
+        self.create_branch_output = QTextEdit()
+        self.create_branch_output.setReadOnly(True)
+
+        layout.addRow(self.create_branch_button)
+        layout.addRow(self.create_branch_output)
+
+        self.create_branch_button.clicked.connect(self.run_create_branch)
+        self.refresh_remote_branches_button.clicked.connect(self.run_refresh_remote_branches)
+        self.add_to_target_button.clicked.connect(self.move_to_target)
+        self.remove_from_target_button.clicked.connect(self.remove_from_target)
+        self.clear_new_branch_history_button.clicked.connect(self.run_clear_new_branch_history)
+
+        self.create_branch_tab.setLayout(layout)
+
+    def filter_available_branches(self, text):
+        for i in range(self.available_branches_list.count()):
+            item = self.available_branches_list.item(i)
+            item.setHidden(text.lower() not in item.text().lower())
+
+    def move_to_target(self):
+        selected_items = self.available_branches_list.selectedItems()
+        for item in selected_items:
+            if not item.isHidden():
+                self.target_branch_list.addItem(item.text())
+                self.available_branches_list.takeItem(self.available_branches_list.row(item))
+
+    def remove_from_target(self):
+        selected_items = self.target_branch_list.selectedItems()
+        for item in selected_items:
+            self.available_branches_list.addItem(item.text())
+            self.target_branch_list.takeItem(self.target_branch_list.row(item))
+
+    def init_create_mr_tab(self):
+        layout = QFormLayout()
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        gitlab_config = self.config.find('gitlab') if self.config is not None else None
+        def get_config_value(element, tag, default=''):
+            if element is not None:
+                found = element.find(tag)
+                if found is not None and found.text:
+                    return found.text.strip()
+            return default
+
+        self.gitlab_url_input = QLineEdit(get_config_value(gitlab_config, 'gitlab_url'))
+        self.token_input = QLineEdit(get_config_value(gitlab_config, 'private_token'))
+        self.token_input.setEchoMode(QLineEdit.Password)
+        self.assignee_combo = NoWheelComboBox()
+        self.reviewer_combo = NoWheelComboBox()
+        self.refresh_users_button = QPushButton('刷新用户')
+
+        self.source_branch_combo = NoWheelComboBox()
+        self.refresh_branches_button = QPushButton('刷新本地分支')
+        
+        self.mr_target_branch_combo = NoWheelComboBox()
+        self.refresh_mr_target_branches_button = QPushButton('刷新远程分支')
+
+        self.mr_title_input = QLineEdit()
+        self.mr_description_input = QTextEdit()
+
+        # 创建按钮布局
+        mr_button_layout = QHBoxLayout()
+        self.view_commits_button = QPushButton('查看提交差异')
+        self.create_mr_button = QPushButton('创建合并请求')
+        mr_button_layout.addWidget(self.view_commits_button)
+        mr_button_layout.addWidget(self.create_mr_button)
+
+        self.mr_output = QTextEdit()
+        self.mr_output.setReadOnly(True)
+
+        layout.addRow('GitLab 地址:', self.gitlab_url_input)
+        layout.addRow('私有 Token:', self.token_input)
+        assignee_layout = QHBoxLayout()
+        assignee_layout.addWidget(self.assignee_combo)
+        assignee_layout.addWidget(self.refresh_users_button)
+        layout.addRow('指派给:', assignee_layout)
+        layout.addRow('审查者:', self.reviewer_combo)
+
+        source_branch_layout = QHBoxLayout()
+        source_branch_layout.addWidget(self.source_branch_combo)
+        self.show_all_branches_checkbox = QCheckBox('显示所有分支')
+        source_branch_layout.addWidget(self.refresh_branches_button)
+        source_branch_layout.addWidget(self.show_all_branches_checkbox)
+        layout.addRow('源分支:', source_branch_layout)
+
+        target_branch_layout = QHBoxLayout()
+        target_branch_layout.addWidget(self.mr_target_branch_combo)
+        target_branch_layout.addWidget(self.refresh_mr_target_branches_button)
+        layout.addRow('目标分支:', target_branch_layout)
+
+        layout.addRow('标题:', self.mr_title_input)
+        layout.addRow('描述:', self.mr_description_input)
+
+        layout.addRow(mr_button_layout)
+        layout.addRow(self.mr_output)
+
+        self.gitlab_url_input.textChanged.connect(self.save_gitlab_basic_config)
+        self.token_input.textChanged.connect(self.save_gitlab_basic_config)
+        self.refresh_branches_button.clicked.connect(self.run_refresh_branches)
+        self.refresh_mr_target_branches_button.clicked.connect(self.run_refresh_mr_target_branches)
+        self.source_branch_combo.currentIndexChanged.connect(self.update_mr_fields)
+        self.view_commits_button.clicked.connect(self.run_view_commits_diff)
+        self.create_mr_button.clicked.connect(self.run_create_mr)
+        self.refresh_users_button.clicked.connect(self.run_refresh_users)
+        self.assignee_combo.currentTextChanged.connect(self.save_gitlab_user_selection)
+        self.reviewer_combo.currentTextChanged.connect(self.save_gitlab_user_selection)
+        self.show_all_branches_checkbox.stateChanged.connect(self.run_refresh_branches)
+
+        self.create_mr_tab.setLayout(layout)
+
+        self.enable_combo_search(self.source_branch_combo)
+        self.enable_combo_search(self.mr_target_branch_combo)
+        self.enable_combo_search(self.assignee_combo)
+        self.enable_combo_search(self.reviewer_combo)
+        self.init_users_selection()
+    
+    def ensure_initialized(self):
+        if not self.initialized:
+            self.run_refresh_remote_branches()
+            self.run_refresh_branches()
+            self.run_refresh_mr_target_branches()
+            self.run_refresh_users()
+            self.initialized = True
+
+    def get_default_new_branch_prefix(self, tab_name=None):
+        node = self.config.find('new_branch_prefix') if self.config is not None else None
+        text = ''
+        if node is not None and node.text:
+            text = node.text
+        tn = tab_name if tab_name is not None else self.workspace_name
+        try:
+            return text.format(tab_name=tn or '')
+        except Exception:
+            return text
+
+    def run_create_branch(self):
+        if self.target_branch_list.count() == 0:
+            self.create_branch_output.setText('请至少选择一个目标分支。')
+            return
+
+        target_branches = [self.target_branch_list.item(i).text() for i in range(self.target_branch_list.count())]
+        new_branch = self.new_branch_combo.currentText()
+
+        self.create_branch_output.setText('处理中...')
+        QApplication.processEvents()
+
+        def _create_all_branches():
+            """执行所有分支创建的阻塞函数"""
+            all_output = []
+            any_success = False
+            for target_branch in target_branches:
+                output = create_branch_func(self.path, target_branch, new_branch)
+                all_output.append(f'--- 对于目标分支: {target_branch} ---\n{output}')
+                if 'Branch created successfully!' in output:
+                    any_success = True
+            return all_output, any_success
+
+        def on_success(result):
+            all_output, any_success = result
+            self.create_branch_output.setText('\n\n'.join(all_output))
+            if any_success and new_branch:
+                self.save_new_branch_to_history(new_branch)
+                prefix = self.get_default_new_branch_prefix()
+                self.new_branch_combo.setEditText(prefix)
+
+        run_blocking(_create_all_branches, on_success=on_success, parent=self)
+
+    def run_refresh_remote_branches(self):
+        self.available_branches_list.clear()
+        self.create_branch_output.setText('正在刷新远程分支...')
+        QApplication.processEvents()
+
+        target_branches = {self.target_branch_list.item(i).text() for i in range(self.target_branch_list.count())}
+
+        def _fetch_branches():
+            return get_remote_branches(self.path)
+
+        def on_success(result):
+            branches, message = result
+            available_branches = [b for b in branches if b not in target_branches]
+            self.available_branches_list.addItems(available_branches)
+            self.create_branch_output.setText(message)
+
+        run_blocking(_fetch_branches, on_success=on_success, parent=self)
+
+    def reload_new_branch_history(self):
+        new_branch_text = self.new_branch_combo.currentText()
+        try:
+            with shelve.open('cache.db') as db:
+                history = db.get('new_branch_history', [])
+            self.new_branch_combo.clear()
+            for item in history:
+                if self.new_branch_combo.findText(item, Qt.MatchFixedString) < 0:
+                    self.new_branch_combo.addItem(item)
+        except Exception:
+            pass
+        if new_branch_text == '':
+            new_branch_text = self.get_default_new_branch_prefix()
+        self.new_branch_combo.setEditText(new_branch_text)
+
+    def load_new_branch_history(self):
+        try:
+            with shelve.open('cache.db') as db:
+                history = db.get('new_branch_history', [])
+            for item in history:
+                if self.new_branch_combo.findText(item, Qt.MatchFixedString) < 0:
+                    self.new_branch_combo.addItem(item)
+        except Exception:
+            pass
+        prefix = self.get_default_new_branch_prefix()
+        self.new_branch_combo.setEditText(prefix)
+
+    def save_new_branch_to_history(self, name):
+        try:
+            with shelve.open('cache.db', writeback=True) as db:
+                history = db.get('new_branch_history', [])
+                if name in history:
+                    history.remove(name)
+                history.insert(0, name)
+                if len(history) > 20:
+                    history = history[:20]
+                db['new_branch_history'] = history
+            if self.new_branch_combo.findText(name, Qt.MatchFixedString) < 0:
+                self.new_branch_combo.addItem(name)
+            prefix = self.get_default_new_branch_prefix()
+            self.new_branch_combo.setEditText(prefix)
+        except Exception:
+            pass
+
+    def get_new_branch_history(self):
+        try:
+            with shelve.open('cache.db') as db:
+                return db.get('new_branch_history', [])
+        except Exception:
+            return []
+
+    def sort_source_branches_by_history(self, branches):
+        hist = self.get_new_branch_history()
+        if not hist:
+            return branches
+        index_map = {h: i for i, h in enumerate(hist)}
+        preferred = []
+        others = []
+        for b in branches:
+            rank = None
+            # 优先完全匹配，其次前缀匹配
+            if b in index_map:
+                rank = index_map[b]
+            else:
+                # 找最长的匹配前缀
+                best_match = None
+                best_len = 0
+                for h in hist:
+                    if b.startswith(h) and len(h) > best_len:
+                        best_match = h
+                        best_len = len(h)
+                if best_match is not None:
+                    rank = index_map[best_match]
+            if rank is not None:
+                preferred.append((rank, b))
+            else:
+                others.append(b)
+        preferred.sort(key=lambda x: x[0])
+        ordered = [b for _, b in preferred] + others
+        return ordered
+
+    def run_clear_new_branch_history(self):
+        reply = QMessageBox.question(self, '清空历史记录',
+                                "确认清空新分支历史记录吗？",
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.No:
+            return
+        try:
+            with shelve.open('cache.db', writeback=True) as db:
+                db['new_branch_history'] = []
+            self.new_branch_combo.clear()
+            prefix = self.get_default_new_branch_prefix()
+            self.new_branch_combo.setEditText(prefix)
+        except Exception:
+            pass
+
+    def run_refresh_branches(self):
+        self.source_branch_combo.clear()
+        self.mr_output.setText('正在加载本地分支...')
+        QApplication.processEvents()
+
+        show_all = hasattr(self, 'show_all_branches_checkbox') and self.show_all_branches_checkbox.isChecked()
+
+        def _fetch_branches(use_all=show_all):
+            if use_all:
+                return get_all_local_branches(self.path)
+            else:
+                return get_local_branches(self.path)
+
+        def on_success(result, use_all=show_all):
+            valid_branches, message = result
+            self.source_branch_combo.clear()  # 再次清空，防止重复
+            if use_all:
+                self.source_branch_combo.addItems(valid_branches)
+            else:
+                ordered = self.sort_source_branches_by_history(valid_branches)
+                self.source_branch_combo.addItems(ordered)
+            self.mr_output.setText(message)
+            if valid_branches:
+                self.update_mr_fields()
+
+        run_blocking(_fetch_branches, on_success=on_success, parent=self)
+
+    def run_refresh_mr_target_branches(self):
+        self.mr_target_branch_combo.clear()
+        self.mr_output.setText('正在刷新远程分支...')
+        QApplication.processEvents()
+
+        def _fetch_branches():
+            return get_remote_branches(self.path)
+
+        def on_success(result):
+            branches, message = result
+            self.mr_target_branch_combo.addItems(branches)
+            self.mr_output.setText(message)
+            self.update_mr_fields()
+
+        run_blocking(_fetch_branches, on_success=on_success, parent=self)
+
+    def enable_combo_search(self, combo):
+        util_enable_combo_search(combo)
+
+    def run_refresh_users(self):
+        self.mr_output.setText('正在刷新用户...')
+        QApplication.processEvents()
+
+        url = self.gitlab_url_input.text()
+        token = self.token_input.text()
+
+        def _fetch_users():
+            return get_gitlab_usernames(url, token)
+
+        def on_success(result):
+            users, error = result
+            if error:
+                self.mr_output.setText(error)
+                return
+            self.assignee_combo.addItems(users)
+            self.reviewer_combo.addItems(users)
+            self.init_users_selection()
+
+        run_blocking(_fetch_users, on_success=on_success, parent=self)
+
+    def init_users_selection(self):
+        gitlab_config = self.config.find('gitlab') if self.config is not None else None
+        def get_config_value(element, tag, default=''):
+            if element is not None:
+                found = element.find(tag)
+                if found is not None and found.text:
+                    return found.text.strip()
+            return default
+        assignee_default = get_config_value(gitlab_config, 'assignee')
+        reviewer_default = get_config_value(gitlab_config, 'reviewer')
+        if assignee_default and self.assignee_combo.findText(assignee_default, Qt.MatchFixedString) >= 0:
+            self.assignee_combo.setCurrentText(assignee_default)
+        elif assignee_default and self.assignee_combo.count() == 0:
+            self.assignee_combo.addItem(assignee_default)
+            self.assignee_combo.setCurrentText(assignee_default)
+        if reviewer_default and self.reviewer_combo.findText(reviewer_default, Qt.MatchFixedString) >= 0:
+            self.reviewer_combo.setCurrentText(reviewer_default)
+        elif reviewer_default and self.reviewer_combo.count() == 0:
+            self.reviewer_combo.addItem(reviewer_default)
+            self.reviewer_combo.setCurrentText(reviewer_default)
+
+    def save_gitlab_user_selection(self):
+        gitlab_config = self.config.find('gitlab')
+        if gitlab_config is None:
+            gitlab_config = ET.SubElement(self.config, 'gitlab')
+        def set_child_text(parent, tag, text):
+            child = parent.find(tag)
+            if child is None:
+                child = ET.SubElement(parent, tag)
+            child.text = text
+        set_child_text(gitlab_config, 'assignee', self.assignee_combo.currentText())
+        set_child_text(gitlab_config, 'reviewer', self.reviewer_combo.currentText())
+        tree = ET.ElementTree(self.config)
+        tree.write('config.xml', encoding='UTF-8', xml_declaration=True)
+
+    def save_gitlab_basic_config(self):
+        gitlab_config = self.config.find('gitlab')
+        if gitlab_config is None:
+            gitlab_config = ET.SubElement(self.config, 'gitlab')
+        def set_child_text(parent, tag, text):
+            child = parent.find(tag)
+            if child is None:
+                child = ET.SubElement(parent, tag)
+            child.text = text
+        set_child_text(gitlab_config, 'gitlab_url', self.gitlab_url_input.text())
+        set_child_text(gitlab_config, 'private_token', self.token_input.text())
+        tree = ET.ElementTree(self.config)
+        tree.write('config.xml', encoding='UTF-8', xml_declaration=True)
+
+    def update_mr_fields(self):
+        source_branch = self.source_branch_combo.currentText()
+        if not source_branch:
+            return
+
+        parsed_target = parse_target_branch_from_source(source_branch)
+        if parsed_target:
+            index = self.mr_target_branch_combo.findText(parsed_target, Qt.MatchFixedString)
+            if index >= 0:
+                self.mr_target_branch_combo.setCurrentIndex(index)
+            else:
+                self.mr_output.setText(f'警告: 从源分支解析的目标分支 "{parsed_target}" 在远程分支列表中未找到。')
+
+        self.update_mr_defaults()
+
+    def update_mr_defaults(self):
+        source_branch = self.source_branch_combo.currentText()
+        if not source_branch:
+            return
+
+        gitlab_config = self.config.find('gitlab') if self.config is not None else None
+        def get_config_value(element, tag, default=''):
+            if element is not None:
+                found = element.find(tag)
+                if found is not None and found.text:
+                    return found.text.strip()
+            return default
+
+        title_template = get_config_value(gitlab_config, 'title_template', 'Draft: {commit_message}')
+        description_template = get_config_value(gitlab_config, 'description_template',
+            '## Description of Changes\\n\\n{commit_message}\\n\\n## Type of Change\\n(Please tick one)\\n- [x] Bug Fix\\n- [ ] Feature\\n- [ ] Refactoring\\n- [ ] Documentation\\n- [ ] Tests\\n\\n## Taiga Number and link\\n(If it is a bug fix or refactor, use Fixes [TG-{tg_number_from_title}](taiga.com). If it is a new feature/user story/task, use Part of [TG-{tg_number_from_title}](taiga.com))\\n\\n## Checklist before review\\n- [x] I have performed a self-review of the code\\n- [x] No conflict with target branch')
+
+        defaults, error = get_mr_defaults(self.path, source_branch, title_template, description_template)
+        if error:
+            self.mr_output.setText(error)
+        else:
+            self.mr_title_input.setText(defaults['title'])
+            self.mr_description_input.setPlainText(defaults['description'])
+
+    def run_create_mr(self):
+        reply = QMessageBox.question(self, '确认创建Merge Request吗？',
+                                     f"源分支: {self.source_branch_combo.currentText()}\n"
+                                     f"目标分支: {self.mr_target_branch_combo.currentText()}\n"
+                                     f"标题: {self.mr_title_input.text()}\n"
+                                     f"描述: \n{self.mr_description_input.toPlainText()}",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.No:
+            return
+        self.mr_output.setText('处理中...')
+        QApplication.processEvents()
+
+        def _create_mr():
+            return generate_mr(
+                self.path,
+                self.gitlab_url_input.text(),
+                self.token_input.text(),
+                self.assignee_combo.currentText(),
+                self.reviewer_combo.currentText(),
+                self.source_branch_combo.currentText(),
+                self.mr_title_input.text(),
+                self.mr_description_input.toPlainText(),
+                self.mr_target_branch_combo.currentText()
+            )
+
+        def on_success(output):
+            self.mr_output.setText(output)
+
+        run_blocking(_create_mr, on_success=on_success, parent=self)
+
+    def run_view_commits_diff(self):
+        """查看源分支相对于目标分支的提交差异"""
+        source_branch = self.source_branch_combo.currentText()
+        target_branch = self.mr_target_branch_combo.currentText()
+
+        if not source_branch:
+            self.mr_output.setText('请先选择源分支。')
+            return
+        if not target_branch:
+            self.mr_output.setText('请先选择目标分支。')
+            return
+
+        self.mr_output.setText('正在获取提交差异...')
+        QApplication.processEvents()
+
+        def _fetch_commits():
+            return get_commits_between_branches(self.path, source_branch, target_branch)
+
+        def on_success(result):
+            commits, error = result
+            if error:
+                self.mr_output.setText(error)
+                dialog = CommitDiffDialog(source_branch, target_branch, [], self)
+                dialog.show_error(error)
+                return
+
+            # 显示对话框
+            dialog = CommitDiffDialog(source_branch, target_branch, commits, self)
+            dialog.exec_()
+
+            # 在输出区域显示摘要
+            if commits:
+                self.mr_output.setText(f'找到 {len(commits)} 个新提交。')
+            else:
+                self.mr_output.setText('源分支与目标分支之间没有新的提交。')
+
+        run_blocking(_fetch_commits, on_success=on_success, parent=self)
+
+    def init_cherry_pick_tab(self):
+        layout = QVBoxLayout()
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        form_layout = QFormLayout()
+
+        # 源分支选择
+        self.cherry_pick_source_combo = NoWheelComboBox()
+        self.enable_combo_search(self.cherry_pick_source_combo)
+        self.refresh_cherry_pick_source_button = QPushButton('刷新分支')
+
+        source_layout = QHBoxLayout()
+        source_layout.addWidget(self.cherry_pick_source_combo)
+        source_layout.addWidget(self.refresh_cherry_pick_source_button)
+        form_layout.addRow('选择源分支:', source_layout)
+
+        # 目标分支选择
+        self.cherry_pick_target_combo = NoWheelComboBox()
+        self.enable_combo_search(self.cherry_pick_target_combo)
+        self.refresh_cherry_pick_target_button = QPushButton('刷新目标分支')
+
+        target_layout = QHBoxLayout()
+        target_layout.addWidget(self.cherry_pick_target_combo)
+        target_layout.addWidget(self.refresh_cherry_pick_target_button)
+        form_layout.addRow('选择目标分支:', target_layout)
+
+        # 按钮区域
+        button_layout = QHBoxLayout()
+        self.cherry_pick_refresh_button = QPushButton('刷新差异')
+        self.cherry_pick_execute_button = QPushButton('执行 Cherry-Pick')
+        button_layout.addWidget(self.cherry_pick_refresh_button)
+        button_layout.addWidget(self.cherry_pick_execute_button)
+        form_layout.addRow('', button_layout)
+
+        layout.addLayout(form_layout)
+
+        # 差异显示区域
+        self.cherry_pick_diff_scroll_area = QVBoxLayout()
+
+        self.scroll_widget = QWidget()
+        self.scroll_widget.setLayout(self.cherry_pick_diff_scroll_area)
+
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidget(self.scroll_widget)
+        self.scroll_area.setWidgetResizable(True)
+
+        layout.addWidget(self.scroll_area)
+
+        # 连接信号
+        self.refresh_cherry_pick_source_button.clicked.connect(self.run_refresh_cherry_pick_source_branches)
+        self.refresh_cherry_pick_target_button.clicked.connect(self.run_refresh_cherry_pick_target_branches)
+        self.cherry_pick_source_combo.currentTextChanged.connect(self.run_refresh_cherry_pick_target_branches)
+        self.cherry_pick_refresh_button.clicked.connect(self.run_cherry_pick_refresh)
+        self.cherry_pick_execute_button.clicked.connect(self.run_cherry_pick_execute)
+
+        self.cherry_pick_tab.setLayout(layout)
+
+        self.run_refresh_cherry_pick_source_branches()
+        self.run_refresh_cherry_pick_target_branches()
+
+    def run_refresh_cherry_pick_source_branches(self):
+        """刷新源分支列表（包含 assignee 相关的分支）"""
+        self.cherry_pick_source_combo.clear()
+
+        for i in reversed(range(self.cherry_pick_diff_scroll_area.count())):
+            self.cherry_pick_diff_scroll_area.itemAt(i).widget().setParent(None)
+
+        loading_label = QLabel('正在加载源分支...')
+        self.cherry_pick_diff_scroll_area.addWidget(loading_label)
+        QApplication.processEvents()
+
+        def _fetch_and_process_branches():
+            import subprocess
+
+            # 获取 assignee 邮箱
+            assignee_email = self.get_config_assignee_email()
+
+            # 获取所有本地分支
+            branches, message = get_all_local_branches(self.path)
+
+            # 获取每个分支的最近提交，检查是否由 assignee 提交
+            assignee_branches = []
+            for branch in branches:
+                # 获取该分支的第一次提交信息
+                result = subprocess.run(
+                    ['git', 'log', '--format=%ae', '-1', branch],
+                    cwd=self.path,
+                    capture_output=True,
+                    text=True
+                )
+
+                if result.returncode == 0 and result.stdout.strip():
+                    commit_email = result.stdout.strip()
+                    # 检查是否包含 assignee 邮箱
+                    if assignee_email and assignee_email.lower() in commit_email.lower():
+                        assignee_branches.append(branch)
+
+            # 按历史排序
+            assignee_branches = self.sort_source_branches_by_history(assignee_branches)
+
+            # 保留完整分支名（不去除 __from__ 后缀）
+            return assignee_branches, message, assignee_email
+
+        def on_success(result):
+            assignee_branches, message, assignee_email = result
+            self.cherry_pick_source_combo.addItems(assignee_branches)
+
+            for i in reversed(range(self.cherry_pick_diff_scroll_area.count())):
+                self.cherry_pick_diff_scroll_area.itemAt(i).widget().setParent(None)
+
+            filter_info = f"筛选条件: 邮箱包含 {assignee_email or '(未配置)'}"
+            result_label = QLabel(f'{message}\n{filter_info}')
+            self.cherry_pick_diff_scroll_area.addWidget(result_label)
+
+        run_blocking(_fetch_and_process_branches, on_success=on_success, parent=self)
+
+    def run_refresh_cherry_pick_target_branches(self):
+        """刷新目标分支列表（包含源分支 TG-xxxx 值的本地分支）"""
+        self.cherry_pick_target_combo.clear()
+
+        source_branch = self.cherry_pick_source_combo.currentText()
+
+        def _fetch_branches():
+            import re
+
+            # 从源分支中提取 TG-xxxx
+            tg_match = re.search(r'TG-\d+', source_branch, re.IGNORECASE)
+            tg_number = tg_match.group(0) if tg_match else None
+
+            if not tg_number:
+                return [], f'源分支 "{source_branch}" 中未找到 TG-xxxx 编号'
+
+            # 获取所有本地分支
+            all_branches, message = get_all_local_branches(self.path)
+
+            # 筛选包含 TG-xxxx 的分支
+            matching_branches = []
+            for branch in all_branches:
+                if tg_number in branch:
+                    matching_branches.append(branch)
+
+            return matching_branches, f'找到 {len(matching_branches)} 个包含 {tg_number} 的本地分支'
+
+        def on_success(result):
+            branches, message = result
+            self.cherry_pick_target_combo.addItems(branches)
+
+        run_blocking(_fetch_branches, on_success=on_success, parent=self)
+
+    def run_cherry_pick_refresh(self):
+        """刷新源分支的提交记录（48小时内由assignee提交的）"""
+        source_branch = self.cherry_pick_source_combo.currentText()
+
+        if not source_branch:
+            self.clear_cherry_pick_area()
+            error_label = QLabel('请先选择源分支。')
+            error_label.setStyleSheet('color: #e74c3c;')
+            self.cherry_pick_diff_scroll_area.addWidget(error_label)
+            return
+
+        # 从 config.xml 获取 assignee 邮箱
+        assignee_email = self.get_config_assignee_email()
+
+        self.clear_cherry_pick_area()
+        loading_label = f'正在获取 "{source_branch}" 的提交记录...'
+        if assignee_email:
+            loading_label += f'\n筛选条件: {assignee_email}, 48小时内'
+        self.cherry_pick_diff_scroll_area.addWidget(QLabel(loading_label))
+        QApplication.processEvents()
+
+        def _fetch_commits():
+            import subprocess
+            from datetime import datetime, timedelta
+
+            # 获取所有本地分支
+            all_branches, message = get_all_local_branches(self.path)
+
+            # 查找匹配的分支：优先精确匹配，其次前缀匹配
+            matching_branches = []
+
+            # 首先检查是否有精确匹配的分支
+            exact_match = None
+            for branch in all_branches:
+                if branch == source_branch:
+                    exact_match = branch
+                    break
+
+            # 其次检查前缀匹配（处理 __from__ 分支）
+            for branch in all_branches:
+                if '__from__' in branch:
+                    branch_prefix = branch.split('__from__')[0]
+                    if branch_prefix == source_branch:
+                        matching_branches.append(branch)
+
+            # 如果有精确匹配，使用它；否则使用前缀匹配的分支
+            if exact_match:
+                matching_branches = [exact_match]
+            elif not matching_branches:
+                return [], [], assignee_email
+
+            # 获取每个分支的提交记录
+            all_commits = []
+            for branch in matching_branches:
+                # 使用 git log 获取详细提交信息
+                result = subprocess.run(
+                    ['git', 'log', '--since', '48 hours ago',
+                     '--pretty=%H|%an|%ae|%ai|%s', branch],
+                    cwd=self.path,
+                    capture_output=True,
+                    text=True
+                )
+
+                if result.returncode == 0 and result.stdout.strip():
+                    for line in result.stdout.strip().split('\n'):
+                        if line.strip():
+                            parts = line.split('|')
+                            if len(parts) >= 5:
+                                commit_hash = parts[0]
+                                author_name = parts[1]
+                                author_email = parts[2]
+                                author_date = parts[3]
+                                commit_msg = '|'.join(parts[4:])
+
+                                all_commits.append({
+                                    'hash': commit_hash,
+                                    'author': author_name,
+                                    'email': author_email,
+                                    'date': author_date,
+                                    'message': commit_msg,
+                                    'source_branch': branch
+                                })
+
+            return all_commits, matching_branches, assignee_email
+
+        def on_success(result):
+            all_commits, matching_branches, assignee_email = result
+
+            # 清除加载标签
+            for i in reversed(range(self.cherry_pick_diff_scroll_area.count())):
+                self.cherry_pick_diff_scroll_area.itemAt(i).widget().setParent(None)
+
+            if not matching_branches:
+                error_label = QLabel(f'找不到分支 "{source_branch}"')
+                error_label.setStyleSheet('color: #e74c3c;')
+                self.cherry_pick_diff_scroll_area.addWidget(error_label)
+                return
+
+            # 过滤提交：48小时内 + assignee邮箱
+            filtered_commits = []
+            from datetime import datetime, timedelta
+
+            for commit in all_commits:
+                # 检查时间（48小时内）
+                try:
+                    commit_date = datetime.fromisoformat(commit['date'].replace('+00:00', ''))
+                    if datetime.now() - commit_date > timedelta(hours=48):
+                        continue
+                except:
+                    pass
+
+                # 检查邮箱
+                if assignee_email and assignee_email.lower() not in commit['email'].lower():
+                    continue
+
+                filtered_commits.append(commit)
+
+            if not filtered_commits:
+                info_msg = f'没有找到符合条件的提交。'
+                if assignee_email:
+                    info_msg += f'\n筛选条件: 邮箱包含 {assignee_email}, 48小时内'
+                info_label = QLabel(info_msg)
+                info_label.setStyleSheet('color: #7f8c8d;')
+                self.cherry_pick_diff_scroll_area.addWidget(info_label)
+                return
+
+            # 显示提交列表，带复选框
+            title_label = QLabel(f'<b>找到 {len(filtered_commits)} 个提交 (48小时内, {assignee_email or "所有用户"}):</b>')
+            title_label.setStyleSheet('color: #2c3e50; font-size: 14px;')
+            self.cherry_pick_diff_scroll_area.addWidget(title_label)
+
+            # 存储复选框的引用
+            self.cherry_pick_commit_checkboxes = []
+
+            for commit in filtered_commits:
+                commit_widget = QWidget()
+                commit_layout = QVBoxLayout()
+                commit_layout.setContentsMargins(0, 5, 0, 5)
+
+                # 第一行：复选框 + 提交信息
+                top_row = QHBoxLayout()
+                checkbox = QCheckBox()
+                checkbox.setChecked(False)
+                checkbox.setStyleSheet('margin-left: 20px;')
+
+                commit_text = QTextEdit()
+                commit_text.setReadOnly(True)
+                commit_text.setPlainText(f'{commit["hash"][:8]} - {commit["message"]}')
+                commit_text.setMaximumHeight(50)
+                commit_text.setStyleSheet('background: #f5f5f5; border: 1px solid #ddd; border-radius: 3px;')
+
+                top_row.addWidget(checkbox)
+                top_row.addWidget(commit_text, 1)
+
+                # 第二行：详细信息
+                info_text = QLabel(f'    作者: {commit["author"]} <{commit["email"]}> | 时间: {commit["date"][:19]} | 分支: {commit["source_branch"]}')
+                info_text.setStyleSheet('color: #7f8c8d; font-size: 11px;')
+
+                commit_layout.addLayout(top_row)
+                commit_layout.addWidget(info_text)
+
+                commit_widget.setLayout(commit_layout)
+                self.cherry_pick_diff_scroll_area.addWidget(commit_widget)
+
+                # 保存复选框和对应的 commit 信息
+                self.cherry_pick_commit_checkboxes.append((checkbox, commit))
+
+        run_blocking(_fetch_commits, on_success=on_success, parent=self)
+
+    def get_config_assignee_email(self):
+        """从 config.xml 获取 assignee 邮箱"""
+        gitlab_config = self.config.find('gitlab') if self.config is not None else None
+        if gitlab_config is not None:
+            assignee_node = gitlab_config.find('assignee')
+            if assignee_node is not None and assignee_node.text:
+                return assignee_node.text.strip()
+        return None
+
+    def run_cherry_pick_execute(self):
+        """执行 cherry-pick 操作"""
+        source_branch = self.cherry_pick_source_combo.currentText()
+        target_branch = self.cherry_pick_target_combo.currentText()
+
+        if not source_branch or not target_branch:
+            self.clear_cherry_pick_area()
+            error_label = QLabel('请先选择源分支和目标分支。')
+            error_label.setStyleSheet('color: #e74c3c;')
+            self.cherry_pick_diff_scroll_area.addWidget(error_label)
+            return
+
+        # 获取选中的提交
+        if not hasattr(self, 'cherry_pick_commit_checkboxes') or not self.cherry_pick_commit_checkboxes:
+            self.clear_cherry_pick_area()
+            error_label = QLabel('请先点击"刷新差异"查看提交列表。')
+            error_label.setStyleSheet('color: #e74c3c;')
+            self.cherry_pick_diff_scroll_area.addWidget(error_label)
+            return
+
+        selected_commits = []
+        for checkbox, commit in self.cherry_pick_commit_checkboxes:
+            if checkbox.isChecked():
+                selected_commits.append(commit)
+
+        if not selected_commits:
+            self.clear_cherry_pick_area()
+            error_label = QLabel('请至少选择一个提交进行 cherry-pick。')
+            error_label.setStyleSheet('color: #e74c3c;')
+            self.cherry_pick_diff_scroll_area.addWidget(error_label)
+            return
+
+        # 确认对话框
+        reply = QMessageBox.question(
+            self, '确认 Cherry-Pick',
+            f"将 {len(selected_commits)} 个提交 cherry-pick 到目标分支 \"{target_branch}\"？\n\n"
+            "这将会切换到目标分支并执行 cherry-pick 操作。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply == QMessageBox.No:
+            return
+
+        # 开始执行 cherry-pick
+        self.execute_cherry_pick_step_by_step(selected_commits, target_branch)
+
+    def execute_cherry_pick_step_by_step(self, selected_commits, target_branch):
+        """逐步执行 cherry-pick，支持冲突解决"""
+        import subprocess
+
+        self.clear_cherry_pick_area()
+        self.cherry_pick_output = QTextEdit()
+        self.cherry_pick_output.setReadOnly(True)
+        self.cherry_pick_diff_scroll_area.addWidget(self.cherry_pick_output)
+
+        self.cherry_pick_stashed = False
+        self.cherry_pick_commits = selected_commits
+        self.cherry_pick_target_branch = target_branch
+        self.cherry_pick_current_index = 0
+        self.cherry_pick_successful = 0
+
+        # 第一步：切换分支
+        self.append_cherry_pick_output(f'--- 切换到目标分支: {target_branch} ---')
+        checkout_result = subprocess.run(
+            ['git', 'checkout', target_branch],
+            cwd=self.path,
+            capture_output=True,
+            text=True
+        )
+        self.append_cherry_pick_output(f'STDOUT:\n{checkout_result.stdout}')
+        if checkout_result.stderr:
+            self.append_cherry_pick_output(f'STDERR:\n{checkout_result.stderr}')
+
+        if checkout_result.returncode != 0:
+            error_msg = checkout_result.stderr or checkout_result.stdout or ''
+            if 'would be overwritten by checkout' in error_msg or 'local changes' in error_msg.lower():
+                # 自动 stash
+                self.append_cherry_pick_output('\n检测到本地更改冲突，自动执行 git stash...')
+                stash_result = subprocess.run(
+                    ['git', 'stash', 'push', '-m', 'cherry-pick-auto-stash'],
+                    cwd=self.path,
+                    capture_output=True,
+                    text=True
+                )
+                self.append_cherry_pick_output(f'Stash STDOUT:\n{stash_result.stdout}')
+                if stash_result.stderr:
+                    self.append_cherry_pick_output(f'Stash STDERR:\n{stash_result.stderr}')
+
+                if stash_result.returncode == 0:
+                    self.cherry_pick_stashed = True
+                    self.append_cherry_pick_output('本地更改已暂存，重新尝试切换分支...\n')
+
+                    checkout_retry = subprocess.run(
+                        ['git', 'checkout', target_branch],
+                        cwd=self.path,
+                        capture_output=True,
+                        text=True
+                    )
+                    self.append_cherry_pick_output(f'STDOUT:\n{checkout_retry.stdout}')
+                    if checkout_retry.stderr:
+                        self.append_cherry_pick_output(f'STDERR:\n{checkout_retry.stderr}')
+                    if checkout_retry.returncode != 0:
+                        self.append_cherry_pick_output(f'切换分支仍然失败！')
+                        return
+                else:
+                    self.append_cherry_pick_output(f'Stash 失败！')
+                    return
+            else:
+                self.append_cherry_pick_output(f'切换分支失败！')
+                return
+
+        self.append_cherry_pick_output('切换分支成功！\n')
+
+        # 开始逐个执行 cherry-pick
+        self.cherry_pick_next_commit()
+
+    def append_cherry_pick_output(self, text):
+        """追加输出到文本框"""
+        self.cherry_pick_output.setPlainText(self.cherry_pick_output.toPlainText() + text + '\n')
+        # 滚动到底部
+        cursor = self.cherry_pick_output.textCursor()
+        cursor.movePosition(cursor.End)
+        self.cherry_pick_output.setTextCursor(cursor)
+        QApplication.processEvents()
+
+    def cherry_pick_next_commit(self):
+        """执行下一个 cherry-pick"""
+        import subprocess
+
+        if self.cherry_pick_current_index >= len(self.cherry_pick_commits):
+            # 全部完成
+            self.append_cherry_pick_output(f'\n--- 完成！成功 cherry-pick 了 {self.cherry_pick_successful} 个提交 ---')
+
+            # 执行 git push
+            self.append_cherry_pick_output(f'\n--- 正在推送到远程仓库 ---')
+            push_result = subprocess.run(
+                ['git', 'push'],
+                cwd=self.path,
+                capture_output=True,
+                text=True
+            )
+            self.append_cherry_pick_output(f'STDOUT:\n{push_result.stdout}')
+            if push_result.stderr:
+                self.append_cherry_pick_output(f'STDERR:\n{push_result.stderr}')
+
+            if push_result.returncode == 0:
+                self.append_cherry_pick_output(f'\n--- 推送成功！---')
+            else:
+                self.append_cherry_pick_output(f'\n--- 推送失败！错误代码: {push_result.returncode} ---')
+
+            if self.cherry_pick_stashed:
+                self.append_cherry_pick_output('\n注意: 之前已执行 git stash 暂存本地更改。')
+                self.append_cherry_pick_output('如需恢复，请使用: git stash pop')
+            return
+
+        commit = self.cherry_pick_commits[self.cherry_pick_current_index]
+        commit_hash = commit['hash']
+        commit_msg = commit['message'][:50]
+
+        self.append_cherry_pick_output(f'--- Cherry-pick ({self.cherry_pick_current_index + 1}/{len(self.cherry_pick_commits)}): {commit_hash[:8]} - {commit_msg} ---')
+
+        cherry_pick_result = subprocess.run(
+            ['git', 'cherry-pick', commit_hash],
+            cwd=self.path,
+            capture_output=True,
+            text=True
+        )
+
+        self.append_cherry_pick_output(f'STDOUT:\n{cherry_pick_result.stdout}')
+        if cherry_pick_result.stderr:
+            self.append_cherry_pick_output(f'STDERR:\n{cherry_pick_result.stderr}')
+
+        if cherry_pick_result.returncode != 0:
+            self.append_cherry_pick_output(f'Cherry-pick 失败！错误代码: {cherry_pick_result.returncode}')
+            self.append_cherry_pick_output('请手动解决冲突后继续。')
+            return
+        else:
+            self.cherry_pick_successful += 1
+            self.append_cherry_pick_output('Cherry-pick 成功！\n')
+
+        # 继续下一个
+        self.cherry_pick_current_index += 1
+        self.cherry_pick_next_commit()
+
+    def clear_cherry_pick_area(self):
+        """清空 cherry-pick 显示区域"""
+        for i in reversed(range(self.cherry_pick_diff_scroll_area.count())):
+            self.cherry_pick_diff_scroll_area.itemAt(i).widget().setParent(None)
