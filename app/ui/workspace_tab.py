@@ -1068,12 +1068,25 @@ class WorkspaceTab(QWidget):
 
             # 执行 git push
             self.append_cherry_pick_output(f'\n--- 正在推送到远程仓库 ---')
+
+            # 先尝试普通 push
             push_result = subprocess.run(
                 ['git', 'push'],
                 cwd=self.path,
                 capture_output=True,
                 text=True
             )
+
+            # 如果失败且是因为没有上游分支，使用 --set-upstream
+            if push_result.returncode != 0 and 'no upstream branch' in push_result.stderr:
+                self.append_cherry_pick_output('检测到没有上游分支，使用 --set-upstream 推送...\n')
+                push_result = subprocess.run(
+                    ['git', 'push', '--set-upstream', 'origin', self.cherry_pick_target_branch],
+                    cwd=self.path,
+                    capture_output=True,
+                    text=True
+                )
+
             self.append_cherry_pick_output(f'STDOUT:\n{push_result.stdout}')
             if push_result.stderr:
                 self.append_cherry_pick_output(f'STDERR:\n{push_result.stderr}')
